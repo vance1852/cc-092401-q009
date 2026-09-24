@@ -11,6 +11,7 @@ from typing import Any, Iterable, Mapping
 from .analysis import ALGORITHM_VERSION, analyze
 from .clock import SystemClock, isoformat
 from .contracts import Observation, Protocol, ValidationError
+from .diffing import diff_protocols
 from .errors import Conflict, Forbidden, InvalidState, NotFound, ValidationFailed
 from .jsonio import canonical_json, content_digest
 from .storage import initialize, transaction
@@ -21,10 +22,47 @@ ROLE_PERMISSIONS = {
         "catalog.write", "batch.create", "batch.start", "observation.import",
         "exclusion.request", "exclusion.revoke",
     },
-    "statistician": {"protocol.publish", "batch.seal", "exclusion.review", "analysis.run"},
+    "statistician": {
+        "protocol.publish", "protocol.draft", "protocol.retire",
+        "batch.seal", "exclusion.review", "analysis.run",
+    },
     "approver": {"decision.write"},
     "auditor": {"report.read", "audit.read"},
 }
+
+# 尚未结束的批次状态；处于这些状态的批次会阻止协议版本退役。
+UNFINISHED_BATCH_STATES = ("draft", "running", "sealed", "analyzing", "analyzed")
+
+
+def protocol_content(raw: Mapping[str, Any]) -> dict[str, Any]:
+    """剥离发布时才分配的版本号，得到协议内容载体。"""
+
+    content = dict(raw)
+    content.pop("version", None)
+    return content
+
+
+def protocol_content_digest(content: Mapping[str, Any]) -> str:
+    """计算跨草案与已发布版本可比的内容摘要（不含版本号）。"""
+
+    return content_digest([content])
+
+
+def _empty_protocol(protocol_id: str) -> dict[str, Any]:
+    """无基线草案的差异基线：所有分区都表现为新增。"""
+
+    return {
+        "protocol_id": protocol_id,
+        "version": 0,
+        "title": "",
+        "task_family": "",
+        "seed": 0,
+        "bootstrap_samples": 0,
+        "strata": [],
+        "metrics": [],
+        "stratum_weights": {},
+        "admission_rules": [],
+    }
 
 
 class TrialService:
@@ -110,38 +148,432 @@ class TrialService:
             raise Conflict("构建编号、版本或摘要冲突") from exc
         return {"build_id": build_id, "robot_id": robot_id, "version": version}
 
+    def _validate_content(self, content: Mapping[str, Any]) -> dict[str, Any]:
+        try:
+            normalized = dict(content)
+            normalized.pop("version", None)
+            Protocol.from_dict({**normalized, "version": 1})
+        except ValidationError as exc:
+            raise ValidationFailed(str(exc)) from exc
+        return normalized
+
     def publish_protocol(self, actor_id: str, raw: Mapping[str, Any]) -> dict[str, Any]:
+        """一次性发布的兼容入口，仍执行连续性与摘要唯一性校验。"""
+
         self._require(actor_id, "protocol.publish")
         try:
             protocol = Protocol.from_dict(raw)
         except ValidationError as exc:
             raise ValidationFailed(str(exc)) from exc
-        text = canonical_json(raw)
-        digest = content_digest([raw])
+        with transaction(self.connection, immediate=True):
+            result = self._insert_published(actor_id, protocol.protocol_id, protocol.version, dict(raw))
+        return result
+
+    def _insert_published(
+        self, actor_id: str, protocol_id: str, version: int, full_raw: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """在已开启的事务中写入一个已发布版本；调用方负责权限与事务。"""
+
+        body = protocol_content(full_raw)
+        body["protocol_id"] = protocol_id
+        body["version"] = version
+        canonical_full = canonical_json(body)
+        digest = protocol_content_digest(protocol_content(body))
+        self._require_version_continuity(protocol_id, version)
+        if self.connection.execute(
+            "SELECT 1 FROM protocol_catalog WHERE content_sha256=?", (digest,)
+        ).fetchone() is not None:
+            raise Conflict("协议内容摘要已经存在，不能重复发布相同内容")
+        now = self._now()
+        self.connection.execute(
+            "INSERT INTO protocol_catalog(protocol_id,version,title,task_family,canonical_json,"
+            "content_sha256,created_at,status) VALUES(?,?,?,?,?,?,?, 'active')",
+            (protocol_id, version, body["title"], body["task_family"], canonical_full, digest, now),
+        )
+        identity = f"{protocol_id}@{version}"
+        self._audit("protocol", identity, "protocol.published", actor_id, {"sha256": digest})
+        return {"protocol_id": protocol_id, "version": version, "sha256": digest}
+
+    def _require_version_continuity(self, protocol_id: str, version: int) -> None:
+        row = self.connection.execute(
+            "SELECT COALESCE(MAX(version), 0) AS max_version FROM protocol_catalog WHERE protocol_id=?",
+            (protocol_id,),
+        ).fetchone()
+        expected = row["max_version"] + 1
+        if version != expected:
+            raise Conflict(f"协议版本不连续：下一个版本必须是 {expected}，不能发布 {version}")
+
+    def create_draft(
+        self, actor_id: str, draft_id: str, content: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require(actor_id, "protocol.draft")
+        body = self._validate_content(content)
+        protocol_id = body["protocol_id"]
+        digest = protocol_content_digest(body)
+        now = self._now()
         try:
             with transaction(self.connection, immediate=True):
+                self._reject_published_digest(digest)
                 self.connection.execute(
-                    "INSERT INTO protocol_catalog(protocol_id,version,title,task_family,canonical_json,content_sha256,created_at) "
-                    "VALUES(?,?,?,?,?,?,?)",
+                    "INSERT INTO protocol_drafts(draft_id,protocol_id,base_version,draft_revision,title,"
+                    "task_family,canonical_json,content_sha256,status,created_by,created_at,updated_at) "
+                    "VALUES(?,?,NULL,1,?,?,?,?,'open',?,?,?)",
                     (
-                        protocol.protocol_id,
-                        protocol.version,
-                        protocol.title,
-                        protocol.task_family,
-                        text,
-                        digest,
-                        self._now(),
+                        draft_id, protocol_id, body["title"], body["task_family"],
+                        canonical_json(body), digest, actor_id, now, now,
                     ),
                 )
-                identity = f"{protocol.protocol_id}@{protocol.version}"
-                self._audit("protocol", identity, "protocol.published", actor_id, {"sha256": digest})
+                self._audit("protocol_draft", draft_id, "draft.created", actor_id, {
+                    "protocol_id": protocol_id, "draft_revision": 1, "sha256": digest,
+                })
         except sqlite3.IntegrityError as exc:
-            raise Conflict("协议版本或内容摘要已经存在") from exc
-        return {"protocol_id": protocol.protocol_id, "version": protocol.version, "sha256": digest}
+            raise Conflict("草案编号已存在") from exc
+        return self.get_draft(draft_id)
+
+    def derive_draft(
+        self,
+        actor_id: str,
+        draft_id: str,
+        protocol_id: str,
+        base_version: int,
+        content: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        self._require(actor_id, "protocol.draft")
+        base_row = self.connection.execute(
+            "SELECT canonical_json,status FROM protocol_catalog WHERE protocol_id=? AND version=?",
+            (protocol_id, base_version),
+        ).fetchone()
+        if base_row is None:
+            raise NotFound("派生所依据的协议版本不存在")
+        base_body = protocol_content(json.loads(base_row["canonical_json"]))
+        if content is None:
+            body = dict(base_body)
+        else:
+            body = self._validate_content(content)
+            if body["protocol_id"] != protocol_id:
+                raise ValidationFailed("草案协议编号必须与派生基线一致")
+        digest = protocol_content_digest(body)
+        now = self._now()
+        try:
+            with transaction(self.connection, immediate=True):
+                # 允许新草案内容暂时与自己的基线一致；与其它已发布版本相同则拒绝。
+                self._reject_published_digest(digest, allow=(protocol_id, base_version))
+                self.connection.execute(
+                    "INSERT INTO protocol_drafts(draft_id,protocol_id,base_version,draft_revision,title,"
+                    "task_family,canonical_json,content_sha256,status,created_by,created_at,updated_at) "
+                    "VALUES(?,?,?,1,?,?,?,?,'open',?,?,?)",
+                    (
+                        draft_id, protocol_id, base_version, body["title"], body["task_family"],
+                        canonical_json(body), digest, actor_id, now, now,
+                    ),
+                )
+                self._audit("protocol_draft", draft_id, "draft.derived", actor_id, {
+                    "protocol_id": protocol_id, "base_version": base_version,
+                    "draft_revision": 1, "sha256": digest,
+                })
+        except sqlite3.IntegrityError as exc:
+            raise Conflict("草案编号已存在") from exc
+        return self.get_draft(draft_id)
+
+    def _reject_published_digest(
+        self, digest: str, allow: tuple[str, int] | None = None
+    ) -> None:
+        row = self.connection.execute(
+            "SELECT protocol_id,version FROM protocol_catalog WHERE content_sha256=?",
+            (digest,),
+        ).fetchone()
+        if row is None:
+            return
+        if allow is not None and row["protocol_id"] == allow[0] and row["version"] == allow[1]:
+            return
+        raise Conflict("该内容与已发布版本完全相同，无需再走草案")
+
+    def _draft_row(self, draft_id: str) -> sqlite3.Row:
+        row = self.connection.execute(
+            "SELECT * FROM protocol_drafts WHERE draft_id=?", (draft_id,)
+        ).fetchone()
+        if row is None:
+            raise NotFound("协议草案不存在")
+        return row
+
+    def _draft_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "draft_id": row["draft_id"],
+            "protocol_id": row["protocol_id"],
+            "base_version": row["base_version"],
+            "draft_revision": row["draft_revision"],
+            "status": row["status"],
+            "published_version": row["published_version"],
+            "title": row["title"],
+            "created_by": row["created_by"],
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "content": json.loads(row["canonical_json"]),
+            "sha256": row["content_sha256"],
+        }
+
+    def get_draft(self, draft_id: str) -> dict[str, Any]:
+        return self._draft_payload(self._draft_row(draft_id))
+
+    def list_drafts(self, protocol_id: str | None = None, status: str | None = None) -> list[dict[str, Any]]:
+        sql = "SELECT * FROM protocol_drafts"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if protocol_id is not None:
+            clauses.append("protocol_id=?")
+            params.append(protocol_id)
+        if status is not None:
+            clauses.append("status=?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY protocol_id, draft_revision DESC, draft_id"
+        rows = self.connection.execute(sql, params).fetchall()
+        return [self._draft_payload(row) for row in rows]
+
+    def revise_draft(
+        self, actor_id: str, draft_id: str, expected_revision: int, content: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require(actor_id, "protocol.draft")
+        body = self._validate_content(content)
+        with transaction(self.connection, immediate=True):
+            row = self._draft_row(draft_id)
+            if row["status"] != "open":
+                raise InvalidState("草案已经发布，不能再修改")
+            if row["draft_revision"] != expected_revision:
+                raise Conflict(
+                    f"草案修订号过期：当前为 {row['draft_revision']}，提交基于 {expected_revision}"
+                )
+            if body["protocol_id"] != row["protocol_id"]:
+                raise ValidationFailed("不能修改草案的协议编号")
+            digest = protocol_content_digest(body)
+            if digest == row["content_sha256"]:
+                raise ValidationFailed("草案内容没有变化")
+            self._reject_published_digest(digest)
+            new_revision = expected_revision + 1
+            now = self._now()
+            try:
+                cursor = self.connection.execute(
+                    "UPDATE protocol_drafts SET draft_revision=?,title=?,task_family=?,canonical_json=?,"
+                    "content_sha256=?,updated_at=? WHERE draft_id=? AND draft_revision=? AND status='open'",
+                    (
+                        new_revision, body["title"], body["task_family"], canonical_json(body),
+                        digest, now, draft_id, expected_revision,
+                    ),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise Conflict("草案更新发生并发冲突") from exc
+            if cursor.rowcount != 1:
+                raise Conflict("草案已被并发修改，请刷新修订号后重试")
+            self._audit("protocol_draft", draft_id, "draft.revised", actor_id, {
+                "from_revision": expected_revision, "draft_revision": new_revision, "sha256": digest,
+            })
+        return self.get_draft(draft_id)
+
+    def diff_draft(self, draft_id: str) -> dict[str, Any]:
+        row = self._draft_row(draft_id)
+        current = json.loads(row["canonical_json"])
+        if row["base_version"] is None:
+            baseline = _empty_protocol(row["protocol_id"])
+            base_version = None
+        else:
+            base_row = self.connection.execute(
+                "SELECT canonical_json FROM protocol_catalog WHERE protocol_id=? AND version=?",
+                (row["protocol_id"], row["base_version"]),
+            ).fetchone()
+            if base_row is None:
+                raise NotFound("草案基线版本已经不存在")
+            baseline = json.loads(base_row["canonical_json"])
+            base_version = row["base_version"]
+        diff = diff_protocols(baseline, {**current, "version": base_version if base_version else 0})
+        return {
+            "draft_id": draft_id,
+            "protocol_id": row["protocol_id"],
+            "draft_revision": row["draft_revision"],
+            "base_version": base_version,
+            "diff": diff,
+        }
+
+    def publish_draft(
+        self, actor_id: str, draft_id: str, expected_revision: int
+    ) -> dict[str, Any]:
+        self._require(actor_id, "protocol.publish")
+        with transaction(self.connection, immediate=True):
+            row = self._draft_row(draft_id)
+            if row["status"] != "open":
+                raise InvalidState("草案已经发布")
+            if row["draft_revision"] != expected_revision:
+                raise Conflict(
+                    f"草案修订号过期：当前为 {row['draft_revision']}，提交基于 {expected_revision}"
+                )
+            body = json.loads(row["canonical_json"])
+            # 发布前再次执行规则完整性校验，拒绝任何不完整内容。
+            self._validate_content(body)
+            latest = self.connection.execute(
+                "SELECT COALESCE(MAX(version), 0) AS max_version FROM protocol_catalog WHERE protocol_id=?",
+                (row["protocol_id"],),
+            ).fetchone()["max_version"]
+            if row["base_version"] is None:
+                if latest != 0:
+                    raise Conflict("该协议已有发布版本，新草案必须派生自最新版本")
+                target_version = 1
+            else:
+                if row["base_version"] != latest:
+                    raise Conflict(
+                        f"基线版本 {row['base_version']} 已不是最新版本 {latest}，请重新派生修订"
+                    )
+                target_version = latest + 1
+            digest = row["content_sha256"]
+            if self.connection.execute(
+                "SELECT 1 FROM protocol_catalog WHERE content_sha256=?", (digest,)
+            ).fetchone() is not None:
+                raise Conflict("协议内容摘要已经存在，不能发布相同内容")
+            full_body = dict(body)
+            full_body["version"] = target_version
+            now = self._now()
+            self.connection.execute(
+                "INSERT INTO protocol_catalog(protocol_id,version,title,task_family,canonical_json,"
+                "content_sha256,created_at,status) VALUES(?,?,?,?,?,?,?, 'active')",
+                (
+                    row["protocol_id"], target_version, body["title"], body["task_family"],
+                    canonical_json(full_body), digest, now,
+                ),
+            )
+            self.connection.execute(
+                "UPDATE protocol_drafts SET status='published',published_version=?,updated_at=? "
+                "WHERE draft_id=? AND status='open'",
+                (target_version, now, draft_id),
+            )
+            identity = f"{row['protocol_id']}@{target_version}"
+            self._audit("protocol", identity, "protocol.published", actor_id, {
+                "draft_id": draft_id, "draft_revision": expected_revision,
+                "base_version": row["base_version"], "sha256": digest,
+            })
+            self._audit("protocol_draft", draft_id, "draft.published", actor_id, {
+                "published_version": target_version, "sha256": digest,
+            })
+        return {
+            "draft_id": draft_id,
+            "protocol_id": row["protocol_id"],
+            "version": target_version,
+            "sha256": digest,
+        }
+
+    def retire_protocol(
+        self, actor_id: str, protocol_id: str, version: int, reason: str
+    ) -> dict[str, Any]:
+        self._require(actor_id, "protocol.retire")
+        if not reason or not reason.strip():
+            raise ValidationFailed("退役理由不能为空")
+        with transaction(self.connection, immediate=True):
+            row = self.connection.execute(
+                "SELECT * FROM protocol_catalog WHERE protocol_id=? AND version=?",
+                (protocol_id, version),
+            ).fetchone()
+            if row is None:
+                raise NotFound("协议版本不存在")
+            if row["status"] == "retired":
+                raise InvalidState("该协议版本已经退役")
+            blocking = self.connection.execute(
+                "SELECT batch_id,state FROM batches "
+                "WHERE protocol_id=? AND protocol_version=? AND state IN ({}) ORDER BY batch_id".format(
+                    ",".join("?" for _ in UNFINISHED_BATCH_STATES)
+                ),
+                (protocol_id, version, *UNFINISHED_BATCH_STATES),
+            ).fetchall()
+            if blocking:
+                raise InvalidState(
+                    "协议版本仍被运行中或未完成批次引用，不能退役："
+                    + ", ".join(f"{item['batch_id']}({item['state']})" for item in blocking)
+                )
+            now = self._now()
+            self.connection.execute(
+                "UPDATE protocol_catalog SET status='retired',retired_at=?,retired_by=?,retire_reason=? "
+                "WHERE protocol_id=? AND version=? AND status='active'",
+                (now, actor_id, reason.strip(), protocol_id, version),
+            )
+            self._audit("protocol", f"{protocol_id}@{version}", "protocol.retired", actor_id, {
+                "reason": reason.strip(),
+            })
+        return {"protocol_id": protocol_id, "version": version, "status": "retired"}
+
+    def get_protocol(self, protocol_id: str, version: int) -> dict[str, Any]:
+        row = self.connection.execute(
+            "SELECT * FROM protocol_catalog WHERE protocol_id=? AND version=?",
+            (protocol_id, version),
+        ).fetchone()
+        if row is None:
+            raise NotFound("协议版本不存在")
+        return {
+            "protocol_id": row["protocol_id"],
+            "version": row["version"],
+            "title": row["title"],
+            "task_family": row["task_family"],
+            "status": row["status"],
+            "sha256": row["content_sha256"],
+            "created_at": row["created_at"],
+            "retired_at": row["retired_at"],
+            "retired_by": row["retired_by"],
+            "retire_reason": row["retire_reason"],
+            "content": json.loads(row["canonical_json"]),
+        }
+
+    def list_protocol_versions(self, protocol_id: str) -> list[dict[str, Any]]:
+        rows = self.connection.execute(
+            "SELECT protocol_id,version,title,status,content_sha256,created_at,retired_at,retired_by,"
+            "retire_reason FROM protocol_catalog WHERE protocol_id=? ORDER BY version",
+            (protocol_id,),
+        ).fetchall()
+        if not rows:
+            raise NotFound("协议不存在")
+        return [dict(row) for row in rows]
+
+    def protocol_history(self, actor_id: str, protocol_id: str) -> dict[str, Any]:
+        user = self._user(actor_id)
+        if user["role"] not in {"statistician", "auditor"}:
+            raise Forbidden("当前角色不能读取协议生命周期轨迹")
+        versions = self.list_protocol_versions(protocol_id)
+        drafts = [
+            self._draft_payload(row)
+            for row in self.connection.execute(
+                "SELECT * FROM protocol_drafts WHERE protocol_id=? ORDER BY created_at,draft_id",
+                (protocol_id,),
+            ).fetchall()
+        ]
+        draft_ids = [item["draft_id"] for item in drafts]
+        if draft_ids:
+            placeholders = ",".join("?" for _ in draft_ids)
+            event_rows = self.connection.execute(
+                "SELECT entity_type,entity_id,event_type,actor_id,payload_json,created_at,event_id "
+                "FROM audit_events WHERE "
+                "(entity_type='protocol' AND entity_id LIKE ?) "
+                f"OR (entity_type='protocol_draft' AND entity_id IN ({placeholders})) "
+                "ORDER BY created_at,event_id",
+                (f"{protocol_id}@%", *draft_ids),
+            ).fetchall()
+        else:
+            event_rows = self.connection.execute(
+                "SELECT entity_type,entity_id,event_type,actor_id,payload_json,created_at,event_id "
+                "FROM audit_events WHERE entity_type='protocol' AND entity_id LIKE ? "
+                "ORDER BY created_at,event_id",
+                (f"{protocol_id}@%",),
+            ).fetchall()
+        events = [
+            {
+                "entity_type": row["entity_type"],
+                "entity_id": row["entity_id"],
+                "event_type": row["event_type"],
+                "actor_id": row["actor_id"],
+                "created_at": row["created_at"],
+                "payload": json.loads(row["payload_json"]),
+            }
+            for row in event_rows
+        ]
+        return {"protocol_id": protocol_id, "versions": versions, "drafts": drafts, "events": events}
 
     def _protocol(self, protocol_id: str, version: int) -> tuple[Protocol, str]:
         row = self.connection.execute(
-            "SELECT canonical_json,content_sha256 FROM protocol_catalog WHERE protocol_id=? AND version=?",
+            "SELECT canonical_json,content_sha256,status FROM protocol_catalog WHERE protocol_id=? AND version=?",
             (protocol_id, version),
         ).fetchone()
         if row is None:
@@ -157,7 +589,14 @@ class TrialService:
         build_id: str,
     ) -> dict[str, Any]:
         self._require(actor_id, "batch.create")
-        self._protocol(protocol_id, protocol_version)
+        catalog = self.connection.execute(
+            "SELECT status FROM protocol_catalog WHERE protocol_id=? AND version=?",
+            (protocol_id, protocol_version),
+        ).fetchone()
+        if catalog is None:
+            raise NotFound("协议版本不存在")
+        if catalog["status"] == "retired":
+            raise InvalidState("协议版本已退役，不能再启动新批次")
         try:
             with transaction(self.connection, immediate=True):
                 self.connection.execute(
@@ -520,6 +959,11 @@ class TrialService:
             raise Forbidden("当前角色不能读取完整报告")
         batch = self.get_batch(batch_id)
         protocol, protocol_digest = self._protocol(batch["protocol_id"], batch["protocol_version"])
+        lifecycle = self.connection.execute(
+            "SELECT status,retired_at,retired_by,retire_reason FROM protocol_catalog "
+            "WHERE protocol_id=? AND version=?",
+            (batch["protocol_id"], batch["protocol_version"]),
+        ).fetchone()
         analysis_row = self.connection.execute(
             "SELECT * FROM analyses WHERE batch_id=? ORDER BY analysis_id DESC LIMIT 1", (batch_id,)
         ).fetchone()
@@ -546,6 +990,10 @@ class TrialService:
                 "sha256": protocol_digest,
                 "seed": protocol.seed,
                 "bootstrap_samples": protocol.bootstrap_samples,
+                "lifecycle_status": lifecycle["status"],
+                "retired_at": lifecycle["retired_at"],
+                "retired_by": lifecycle["retired_by"],
+                "retire_reason": lifecycle["retire_reason"],
             },
             "analysis": None if analysis_row is None else {
                 "analysis_id": analysis_row["analysis_id"],

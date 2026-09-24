@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -26,9 +26,32 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
     canonical_json TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+    retired_at TEXT,
+    retired_by TEXT REFERENCES users(user_id),
+    retire_reason TEXT,
     PRIMARY KEY (protocol_id, version),
     UNIQUE (content_sha256)
 );
+
+CREATE TABLE IF NOT EXISTS protocol_drafts (
+    draft_id TEXT PRIMARY KEY,
+    protocol_id TEXT NOT NULL,
+    base_version INTEGER,
+    draft_revision INTEGER NOT NULL CHECK (draft_revision > 0),
+    title TEXT NOT NULL,
+    task_family TEXT NOT NULL,
+    canonical_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    status TEXT NOT NULL CHECK (status IN ('open', 'published')),
+    published_version INTEGER,
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS protocol_drafts_protocol_status
+ON protocol_drafts(protocol_id, status);
 
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -160,16 +183,49 @@ CREATE TABLE IF NOT EXISTS audit_events (
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
-    "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
+    "schema_meta", "protocol_catalog", "protocol_drafts", "users", "robots", "builds",
+    "batches", "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })
 
 
-def connect(path: str | Path) -> sqlite3.Connection:
-    """打开连接并启用严格的事务与外键设置。"""
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
 
-    connection = sqlite3.connect(str(path), isolation_level=None)
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """为早于当前模式版本的数据库补齐新增列。"""
+
+    if "protocol_catalog" in _table_names(connection):
+        columns = _column_names(connection, "protocol_catalog")
+        if "status" not in columns:
+            connection.execute(
+                "ALTER TABLE protocol_catalog ADD COLUMN status TEXT NOT NULL DEFAULT 'active' "
+                "CHECK (status IN ('active', 'retired'))"
+            )
+        if "retired_at" not in columns:
+            connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retired_at TEXT")
+        if "retired_by" not in columns:
+            connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retired_by TEXT REFERENCES users(user_id)")
+        if "retire_reason" not in columns:
+            connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retire_reason TEXT")
+
+
+def _table_names(connection: sqlite3.Connection) -> set[str]:
+    rows = connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+    ).fetchall()
+    return {row["name"] for row in rows}
+
+
+def connect(path: str | Path) -> sqlite3.Connection:
+    """打开连接并启用严格的事务与外键设置。
+
+    HTTP 服务以多线程方式复用单个连接，因此关闭同线程限制；所有写操作都通过
+    ``BEGIN IMMEDIATE`` 串行化，并由 ``busy_timeout`` 处理偶发锁竞争。
+    """
+
+    connection = sqlite3.connect(str(path), isolation_level=None, check_same_thread=False)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA foreign_keys = ON")
     connection.execute("PRAGMA busy_timeout = 5000")
@@ -195,6 +251,7 @@ def initialize(connection: sqlite3.Connection) -> None:
 
     connection.executescript(SCHEMA_SQL)
     with transaction(connection, immediate=True):
+        _migrate(connection)
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

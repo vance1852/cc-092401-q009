@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .errors import ServiceError, ValidationFailed
 from .service import TrialService
@@ -51,7 +51,9 @@ class JsonApplication:
         self, method: str, target: str, headers: Mapping[str, str] | None = None, body: bytes = b""
     ) -> Response:
         normalized_headers = {key.lower(): value for key, value in (headers or {}).items()}
-        path = urlparse(target).path.rstrip("/") or "/"
+        parsed_target = urlparse(target)
+        path = parsed_target.path.rstrip("/") or "/"
+        query = parse_qs(parsed_target.query)
         parts = [part for part in path.split("/") if part]
         try:
             if method == "GET" and path == "/health":
@@ -73,6 +75,50 @@ class JsonApplication:
                 return Response(201, result)
             if method == "POST" and path == "/protocols":
                 return Response(201, self.service.publish_protocol(self._actor(normalized_headers), payload))
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocols" and parts[2] == "versions":
+                return Response(200, {
+                    "versions": self.service.list_protocol_versions(parts[1])
+                })
+            if method == "GET" and len(parts) == 4 and parts[0] == "protocols" and parts[2] == "versions":
+                return Response(200, self.service.get_protocol(parts[1], int(parts[3])))
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocols" and parts[2] == "history":
+                return Response(200, self.service.protocol_history(self._actor(normalized_headers), parts[1]))
+            if method == "POST" and len(parts) == 5 and parts[0] == "protocols" and parts[2] == "versions" and parts[4] == "retire":
+                result = self.service.retire_protocol(
+                    self._actor(normalized_headers), parts[1], int(parts[3]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 5 and parts[0] == "protocols" and parts[2] == "versions" and parts[4] == "derive-draft":
+                result = self.service.derive_draft(
+                    self._actor(normalized_headers), payload["draft_id"], parts[1],
+                    int(parts[3]), payload.get("content"),
+                )
+                return Response(201, result)
+            if method == "POST" and path == "/protocol-drafts":
+                result = self.service.create_draft(
+                    self._actor(normalized_headers), payload["draft_id"], payload["content"]
+                )
+                return Response(201, result)
+            if method == "GET" and path == "/protocol-drafts":
+                result = self.service.list_drafts(
+                    query.get("protocol_id", [None])[0], query.get("status", [None])[0]
+                )
+                return Response(200, {"drafts": result})
+            if method == "GET" and len(parts) == 2 and parts[0] == "protocol-drafts":
+                return Response(200, self.service.get_draft(parts[1]))
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocol-drafts" and parts[2] == "diff":
+                return Response(200, self.service.diff_draft(parts[1]))
+            if method == "POST" and len(parts) == 3 and parts[0] == "protocol-drafts" and parts[2] == "revise":
+                result = self.service.revise_draft(
+                    self._actor(normalized_headers), parts[1],
+                    int(payload["expected_revision"]), payload["content"],
+                )
+                return Response(200, result)
+            if method == "POST" and len(parts) == 3 and parts[0] == "protocol-drafts" and parts[2] == "publish":
+                result = self.service.publish_draft(
+                    self._actor(normalized_headers), parts[1], int(payload["expected_revision"])
+                )
+                return Response(200, result)
             if method == "POST" and path == "/batches":
                 result = self.service.create_batch(
                     self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
