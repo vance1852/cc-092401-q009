@@ -36,7 +36,8 @@ class ServiceTests(unittest.TestCase):
         ]
         self.service.register_robot("operator", "robot-a", "A 型", "厂商")
         self.service.register_build("operator", "build-a", "robot-a", "1.0", "b" * 64)
-        self.service.publish_protocol("stat", self.protocol)
+        self.service.create_draft("stat", "draft-init", self.protocol)
+        self.service.publish_draft("stat", "draft-init", 1)
         self.service.create_batch("operator", "batch-a", "demo-delivery-v1", 1, "build-a")
         self.service.start_batch("operator", "batch-a", 1)
 

@@ -8,7 +8,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
@@ -26,9 +26,44 @@ CREATE TABLE IF NOT EXISTS protocol_catalog (
     canonical_json TEXT NOT NULL,
     content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
     created_at TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'retired')),
+    retired_at TEXT,
+    retired_by TEXT REFERENCES users(user_id),
+    retire_reason TEXT,
     PRIMARY KEY (protocol_id, version),
     UNIQUE (content_sha256)
 );
+
+CREATE TABLE IF NOT EXISTS protocol_drafts (
+    draft_id TEXT PRIMARY KEY,
+    protocol_id TEXT NOT NULL,
+    base_version INTEGER,
+    title TEXT NOT NULL,
+    state TEXT NOT NULL CHECK (state IN ('open', 'published', 'discarded')),
+    revision INTEGER NOT NULL DEFAULT 1 CHECK (revision > 0),
+    created_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    updated_by TEXT REFERENCES users(user_id),
+    updated_at TEXT,
+    published_version INTEGER,
+    published_at TEXT,
+    closed_reason TEXT,
+    FOREIGN KEY (protocol_id, base_version) REFERENCES protocol_catalog(protocol_id, version)
+);
+
+CREATE TABLE IF NOT EXISTS protocol_revisions (
+    draft_id TEXT NOT NULL REFERENCES protocol_drafts(draft_id),
+    revision INTEGER NOT NULL CHECK (revision > 0),
+    proposed_version INTEGER NOT NULL CHECK (proposed_version > 0),
+    canonical_json TEXT NOT NULL,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    edit_note TEXT,
+    edited_by TEXT NOT NULL REFERENCES users(user_id),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (draft_id, revision)
+);
+
+CREATE INDEX IF NOT EXISTS protocol_drafts_state_index ON protocol_drafts(state, protocol_id);
 
 CREATE TABLE IF NOT EXISTS users (
     user_id TEXT PRIMARY KEY,
@@ -160,7 +195,8 @@ CREATE TABLE IF NOT EXISTS audit_events (
 """
 
 REQUIRED_TABLES = frozenset({
-    "schema_meta", "protocol_catalog", "users", "robots", "builds", "batches",
+    "schema_meta", "protocol_catalog", "protocol_drafts", "protocol_revisions",
+    "users", "robots", "builds", "batches",
     "observations", "idempotency_keys", "exclusion_requests", "analysis_jobs",
     "analyses", "decisions", "audit_events",
 })
@@ -190,10 +226,30 @@ def transaction(connection: sqlite3.Connection, *, immediate: bool = False) -> I
         connection.commit()
 
 
+def _migrate(connection: sqlite3.Connection) -> None:
+    """对已存在的旧版本数据库补齐表与列。"""
+
+    catalog_columns = {
+        row["name"] for row in connection.execute("PRAGMA table_info(protocol_catalog)").fetchall()
+    }
+    if catalog_columns and "status" not in catalog_columns:
+        connection.execute(
+            "ALTER TABLE protocol_catalog ADD COLUMN status TEXT NOT NULL DEFAULT 'active' "
+            "CHECK (status IN ('active', 'retired'))"
+        )
+    if catalog_columns and "retired_at" not in catalog_columns:
+        connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retired_at TEXT")
+    if catalog_columns and "retired_by" not in catalog_columns:
+        connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retired_by TEXT REFERENCES users(user_id)")
+    if catalog_columns and "retire_reason" not in catalog_columns:
+        connection.execute("ALTER TABLE protocol_catalog ADD COLUMN retire_reason TEXT")
+
+
 def initialize(connection: sqlite3.Connection) -> None:
     """初始化基础资料表，重复执行不改变已有数据。"""
 
     connection.executescript(SCHEMA_SQL)
+    _migrate(connection)
     with transaction(connection, immediate=True):
         connection.execute(
             "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "

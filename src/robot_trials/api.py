@@ -9,11 +9,16 @@ from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Mapping
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from .errors import ServiceError, ValidationFailed
 from .service import TrialService
 from .storage import connect
+
+
+def _query(target: str) -> dict[str, str]:
+    parsed = parse_qs(urlparse(target).query)
+    return {key: values[-1] for key, values in parsed.items()}
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,8 +76,99 @@ class JsonApplication:
                     payload["version"], payload["content_sha256"],
                 )
                 return Response(201, result)
-            if method == "POST" and path == "/protocols":
-                return Response(201, self.service.publish_protocol(self._actor(normalized_headers), payload))
+            if method == "GET" and path == "/protocols":
+                include_retired = _query(target).get("include_retired", "true").lower() not in {"0", "false"}
+                return Response(200, self.service.list_protocols(self._actor(normalized_headers), include_retired))
+            if method == "POST" and path == "/protocols/drafts":
+                result = self.service.create_draft(
+                    self._actor(normalized_headers),
+                    payload["draft_id"],
+                    payload["protocol"],
+                    payload.get("edit_note", ""),
+                )
+                return Response(201, result)
+            if method == "GET" and path == "/protocols/drafts":
+                state = _query(target).get("state")
+                return Response(200, self.service.list_drafts(self._actor(normalized_headers), state))
+            if method == "POST" and len(parts) == 3 and parts[0] == "protocols" and parts[2] == "derive":
+                result = self.service.derive_draft(
+                    self._actor(normalized_headers),
+                    payload["draft_id"],
+                    parts[1],
+                    int(payload["base_version"]),
+                    payload.get("edit_note", ""),
+                )
+                return Response(201, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocols" and parts[1] == "drafts":
+                return Response(200, self.service.get_draft(self._actor(normalized_headers), parts[2]))
+            if (
+                method == "POST"
+                and len(parts) == 4
+                and parts[0] == "protocols"
+                and parts[1] == "drafts"
+                and parts[3] == "revisions"
+            ):
+                result = self.service.update_draft(
+                    self._actor(normalized_headers),
+                    parts[2],
+                    int(payload["expected_revision"]),
+                    payload["protocol"],
+                    payload.get("edit_note", ""),
+                )
+                return Response(200, result)
+            if (
+                method == "POST"
+                and len(parts) == 4
+                and parts[0] == "protocols"
+                and parts[1] == "drafts"
+                and parts[3] == "diff"
+            ):
+                against = _query(target).get("against_version")
+                result = self.service.draft_diff(
+                    self._actor(normalized_headers), parts[2], None if against is None else int(against)
+                )
+                return Response(200, result)
+            if (
+                method == "POST"
+                and len(parts) == 4
+                and parts[0] == "protocols"
+                and parts[1] == "drafts"
+                and parts[3] == "publish"
+            ):
+                result = self.service.publish_draft(
+                    self._actor(normalized_headers),
+                    parts[2],
+                    int(payload["expected_revision"]),
+                    payload.get("note", ""),
+                )
+                return Response(200, result)
+            if (
+                method == "POST"
+                and len(parts) == 4
+                and parts[0] == "protocols"
+                and parts[1] == "drafts"
+                and parts[3] == "discard"
+            ):
+                result = self.service.discard_draft(
+                    self._actor(normalized_headers),
+                    parts[2],
+                    int(payload["expected_revision"]),
+                    payload["reason"],
+                )
+                return Response(200, result)
+            if (
+                method == "POST"
+                and len(parts) == 5
+                and parts[0] == "protocols"
+                and parts[2] == "versions"
+                and parts[4] == "retire"
+            ):
+                result = self.service.retire_protocol(
+                    self._actor(normalized_headers), parts[1], int(parts[3]), payload["reason"]
+                )
+                return Response(200, result)
+            if method == "GET" and len(parts) == 3 and parts[0] == "protocols" and parts[2] == "timeline":
+                return Response(200, self.service.protocol_timeline(self._actor(normalized_headers), parts[1]))
             if method == "POST" and path == "/batches":
                 result = self.service.create_batch(
                     self._actor(normalized_headers), payload["batch_id"], payload["protocol_id"],
